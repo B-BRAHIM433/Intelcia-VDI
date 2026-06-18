@@ -1,0 +1,165 @@
+{
+  "Comment": "VDI Deploy - Push READY_FOR_DEPLOYMENT bundles to pools",
+  "StartAt": "LoadReadyTenants",
+  "States": {
+    "LoadReadyTenants": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:scan",
+      "Parameters": {
+        "TableName": "GImages_State_TABLE",
+        "FilterExpression": "DeployStatus = :s",
+        "ExpressionAttributeValues": {
+          ":s": {
+            "S": "READY_FOR_DEPLOYMENT"
+          }
+        },
+        "ProjectionExpression": "PK, PoolId, CandidateBundleId, CurrentImageVersion"
+      },
+      "ResultPath": "$.Tenants",
+      "Next": "CheckIfAnyReady"
+    },
+    "CheckIfAnyReady": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.Tenants.Count",
+          "NumericGreaterThan": 0,
+          "Next": "DeployEachTenant"
+        }
+      ],
+      "Default": "DeploySucceeded"
+    },
+    "DeployEachTenant": {
+      "Type": "Map",
+      "ItemsPath": "$.Tenants.Items",
+      "MaxConcurrency": 25,
+      "ToleratedFailureCount": 100,
+      "ResultPath": "$.DeployResults",
+      "Iterator": {
+        "StartAt": "UpdatePool",
+        "States": {
+          "UpdatePool": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:workspaces:updateWorkspacesPool",
+            "Parameters": {
+              "PoolId.$": "$.PoolId.S",
+              "BundleId.$": "$.CandidateBundleId.S"
+            },
+            "ResultPath": "$.PoolResult",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "RecordDeployFailure",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "MarkActive"
+          },
+          "MarkActive": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "GImages_State_TABLE",
+              "Key": {
+                "PK": {
+                  "S.$": "$.PK.S"
+                }
+              },
+              "UpdateExpression": "SET DeployStatus = :s, LastDeployTime = :t",
+              "ExpressionAttributeValues": {
+                ":s": {
+                  "S": "ACTIVE"
+                },
+                ":t": {
+                  "S.$": "$$.Execution.StartTime"
+                }
+              }
+            },
+            "ResultPath": null,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "RecordDeployFailure",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "RecordDeploySuccess"
+          },
+          "RecordDeploySuccess": {
+            "Type": "Pass",
+            "Parameters": {
+              "Client.$": "$.PK.S",
+              "Status": "DEPLOYED",
+              "Version.$": "$.CurrentImageVersion.S",
+              "Bundle.$": "$.CandidateBundleId.S",
+              "Pool.$": "$.PoolId.S"
+            },
+            "End": true
+          },
+          "RecordDeployFailure": {
+            "Type": "Pass",
+            "Parameters": {
+              "Client.$": "$.PK.S",
+              "Status": "DEPLOY_FAILED",
+              "Version": "N/A",
+              "Bundle": "N/A",
+              "Pool": "N/A"
+            },
+            "End": true
+          }
+        }
+      },
+      "Next": "SendDeployReport"
+    },
+    "SendDeployReport": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:eu-central-1:274196731166:UpdatesValidationEmail",
+        "Subject.$": "States.Format('[VDI Deploy] Rapport du {} - {} client(s)', States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0), States.ArrayLength($.DeployResults))",
+        "Message.$": "States.Format('========================================\nRAPPORT DEPLOIEMENT VDI\n========================================\nDate:    {}\nClients: {}\n========================================\n\n{}\n\n========================================\nLes employes verront la nouvelle image\na leur prochaine connexion.\n========================================', States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0), States.ArrayLength($.DeployResults), States.JsonToString($.DeployResults))"
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "DeployFailed",
+          "ResultPath": "$.notifError"
+        }
+      ],
+      "Next": "DeploySucceeded"
+    },
+    "DeployFailed": {
+      "Type": "Fail"
+    },
+    "DeploySucceeded": {
+      "Type": "Succeed"
+    }
+  }
+}
