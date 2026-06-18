@@ -1,0 +1,1497 @@
+{
+  "Comment": "VDI Image Factory - Multi-Tenant Orchestrator",
+  "StartAt": "LoadActiveTenants",
+  "States": {
+    "LoadActiveTenants": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:scan",
+      "Parameters": {
+        "TableName": "GImages_State_TABLE",
+        "FilterExpression": "DeployStatus = :s1 OR DeployStatus = :s2 OR DeployStatus = :s3",
+        "ExpressionAttributeValues": {
+          ":s1": {
+            "S": "ACTIVE"
+          },
+          ":s2": {
+            "S": "BUILD_FAILED"
+          },
+          ":s3": {
+            "S": "ROLLED_BACK"
+          }
+        },
+        "ProjectionExpression": "PK, SourceAmiId, BuildSubnetId, PoolId, MajorVersion, MinorVersion, DeployStatus, CandidateBundleId, CurrentWSIId, CurrentImageVersion, PreviousBundleId, PreviousWSIId, PreviousAmiId, PreviousVersion"
+      },
+      "ResultPath": "$.Tenants",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "GlobalFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "CheckIfTenantsExist"
+    },
+    "CheckIfTenantsExist": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.Tenants.Count",
+          "NumericGreaterThan": 0,
+          "Next": "ProcessEachTenant"
+        }
+      ],
+      "Default": "NoTenantsFound"
+    },
+    "NoTenantsFound": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:eu-central-1:274196731166:UpdatesValidationEmail",
+        "Subject.$": "States.Format('[VDI Factory] {} - Aucun client actif', States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0))",
+        "Message.$": "States.Format('Execution du {} : aucun client en statut ACTIVE, BUILD_FAILED ou ROLLED_BACK.\nRien a faire.', States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0))"
+      },
+      "ResultPath": null,
+      "Next": "ExecutionSucceeded"
+    },
+    "GlobalFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:eu-central-1:274196731166:UpdatesValidationEmail",
+        "Subject.$": "States.Format('[VDI Factory] ERREUR CRITIQUE - {}', States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0))",
+        "Message.$": "States.Format('Erreur critique lors du scan DynamoDB.\nExecution: {}\nErreur: {}\n\nVerifier les permissions IAM et la table GImages_State_TABLE.', $$.Execution.Name, States.JsonToString($.error))"
+      },
+      "ResultPath": null,
+      "Next": "ExecutionSucceeded"
+    },
+    "ProcessEachTenant": {
+      "Type": "Map",
+      "MaxConcurrency": 10,
+      "ToleratedFailureCount": 100,
+      "ItemsPath": "$.Tenants.Items",
+      "ResultPath": "$.BuildResults",
+      "Iterator": {
+        "StartAt": "ResetIfFailed",
+        "States": {
+          "ResetIfFailed": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.DeployStatus.S",
+                "StringEquals": "BUILD_FAILED",
+                "Next": "ResetToActive"
+              }
+            ],
+            "Default": "MarkInProgress"
+          },
+          "ResetToActive": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "GImages_State_TABLE",
+              "Key": {
+                "PK": {
+                  "S.$": "$.PK.S"
+                }
+              },
+              "UpdateExpression": "SET DeployStatus = :s",
+              "ExpressionAttributeValues": {
+                ":s": {
+                  "S": "ACTIVE"
+                }
+              }
+            },
+            "ResultPath": null,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "RecordFailure",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "MarkInProgress"
+          },
+          "MarkInProgress": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "GImages_State_TABLE",
+              "Key": {
+                "PK": {
+                  "S.$": "$.PK.S"
+                }
+              },
+              "UpdateExpression": "SET DeployStatus = :new",
+              "ConditionExpression": "DeployStatus = :expected OR DeployStatus = :rolled",
+              "ExpressionAttributeValues": {
+                ":new": {
+                  "S": "IN_PROGRESS"
+                },
+                ":expected": {
+                  "S": "ACTIVE"
+                },
+                ":rolled": {
+                  "S": "ROLLED_BACK"
+                }
+              }
+            },
+            "ResultPath": null,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 1,
+                "BackoffRate": 1
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "DynamoDB.ConditionalCheckFailedException",
+                  "DynamoDb.ConditionalCheckFailedException"
+                ],
+                "Next": "SkipAlreadyInProgress",
+                "ResultPath": "$.skipReason"
+              },
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "RecordFailure",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "IncrementVersion"
+          },
+          "SkipAlreadyInProgress": {
+            "Type": "Pass",
+            "Parameters": {
+              "Client.$": "$.PK.S",
+              "Status": "SKIPPED",
+              "Version": "N/A",
+              "BuildDate": "N/A",
+              "AmiId": "N/A",
+              "WsiId": "N/A",
+              "BundleId": "N/A",
+              "BundleName": "N/A",
+              "SecurityUpdates": "N/A",
+              "AppUpdates": "N/A",
+              "WSIDescription": "N/A",
+              "Error": "Client deja en cours dans une autre execution - ignore"
+            },
+            "End": true
+          },
+          "IncrementVersion": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "GImages_State_TABLE",
+              "Key": {
+                "PK": {
+                  "S.$": "$.PK.S"
+                }
+              },
+              "UpdateExpression": "SET MinorVersion = if_not_exists(MinorVersion, :zero) + :inc",
+              "ConditionExpression": "MinorVersion < :maxMinor",
+              "ExpressionAttributeValues": {
+                ":inc": {
+                  "N": "1"
+                },
+                ":zero": {
+                  "N": "0"
+                },
+                ":maxMinor": {
+                  "N": "9"
+                }
+              },
+              "ReturnValues": "ALL_NEW"
+            },
+            "ResultPath": "$.VersionUpdate",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 1,
+                "BackoffRate": 1
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "DynamoDB.ConditionalCheckFailedException",
+                  "DynamoDb.ConditionalCheckFailedException"
+                ],
+                "Next": "BumpMajorVersion",
+                "ResultPath": "$.versionError"
+              },
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "MarkTenantFailed",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "BuildVersionString"
+          },
+          "BumpMajorVersion": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "GImages_State_TABLE",
+              "Key": {
+                "PK": {
+                  "S.$": "$.PK.S"
+                }
+              },
+              "UpdateExpression": "SET MajorVersion = MajorVersion + :inc, MinorVersion = :zero",
+              "ExpressionAttributeValues": {
+                ":inc": {
+                  "N": "1"
+                },
+                ":zero": {
+                  "N": "0"
+                }
+              },
+              "ReturnValues": "ALL_NEW"
+            },
+            "ResultPath": "$.VersionUpdate",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "MarkTenantFailed",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "BuildVersionString"
+          },
+          "BuildVersionString": {
+            "Type": "Pass",
+            "Parameters": {
+              "Version.$": "States.Format('{}.{}', $.VersionUpdate.Attributes.MajorVersion.N, $.VersionUpdate.Attributes.MinorVersion.N)",
+              "BuildDate.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)"
+            },
+            "ResultPath": "$.VersionInfo",
+            "Next": "StartSSMAutomation"
+          },
+          "StartSSMAutomation": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ssm:startAutomationExecution",
+            "Parameters": {
+              "DocumentName": "VDI_Factory",
+              "Parameters": {
+                "SourceAmiId.$": "States.Array($.SourceAmiId.S)",
+                "SubnetId.$": "States.Array($.BuildSubnetId.S)",
+                "InstanceProfileName": [
+                  "Role-ImageBuilder-WorkSpaces"
+                ],
+                "AutomationAssumeRole": [
+                  "arn:aws:iam::274196731166:role/SSM-Automation-Role."
+                ],
+                "ImageName.$": "States.Array(States.Format('{}-v{}-{}', $.PK.S, $.VersionInfo.Version, $.VersionInfo.BuildDate))",
+                "ClientName.$": "States.Array($.PK.S)"
+              },
+              "Mode": "Auto"
+            },
+            "ResultPath": "$.SSMStartResponse",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "RollbackVersion",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "WaitSSM"
+          },
+          "WaitSSM": {
+            "Type": "Wait",
+            "Seconds": 240,
+            "Next": "GetSSMStatus"
+          },
+          "GetSSMStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ssm:getAutomationExecution",
+            "Parameters": {
+              "AutomationExecutionId.$": "$.SSMStartResponse.AutomationExecutionId"
+            },
+            "ResultPath": "$.SSMStatus",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 15,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "CancelSSMAndFail",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "IsSSMFinished"
+          },
+          "IsSSMFinished": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.SSMStatus.AutomationExecution.AutomationExecutionStatus",
+                "StringEquals": "Success",
+                "Next": "ExtractUpdateSummary"
+              },
+              {
+                "Variable": "$.SSMStatus.AutomationExecution.AutomationExecutionStatus",
+                "StringEquals": "Failed",
+                "Next": "RollbackVersion"
+              },
+              {
+                "Variable": "$.SSMStatus.AutomationExecution.AutomationExecutionStatus",
+                "StringEquals": "TimedOut",
+                "Next": "RollbackVersion"
+              },
+              {
+                "Variable": "$.SSMStatus.AutomationExecution.AutomationExecutionStatus",
+                "StringEquals": "Cancelled",
+                "Next": "RollbackVersion"
+              }
+            ],
+            "Default": "WaitSSM"
+          },
+          "CancelSSMAndFail": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ssm:stopAutomationExecution",
+            "Parameters": {
+              "AutomationExecutionId.$": "$.SSMStartResponse.AutomationExecutionId"
+            },
+            "ResultPath": null,
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "RollbackVersion",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "RollbackVersion"
+          },
+          "ExtractUpdateSummary": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ssm:getAutomationExecution",
+            "Parameters": {
+              "AutomationExecutionId.$": "$.SSMStartResponse.AutomationExecutionId"
+            },
+            "ResultPath": "$.SSMFull",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "SetDefaultUpdateInfo",
+                "ResultPath": "$.summaryError"
+              }
+            ],
+            "Next": "GetSecurityCommandOutput"
+          },
+          "GetSecurityCommandOutput": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+            "Parameters": {
+              "CommandId.$": "$.SSMFull.AutomationExecution.StepExecutions[3].Outputs.CommandId[0]",
+              "InstanceId.$": "$.SSMFull.AutomationExecution.StepExecutions[0].Outputs.InstanceIds[0]"
+            },
+            "ResultPath": "$.SecurityCommandResult",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "SetDefaultUpdateInfo",
+                "ResultPath": "$.summaryError"
+              }
+            ],
+            "Next": "GetAppsCommandOutput"
+          },
+          "GetAppsCommandOutput": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+            "Parameters": {
+              "CommandId.$": "$.SSMFull.AutomationExecution.StepExecutions[5].Outputs.CommandId[0]",
+              "InstanceId.$": "$.SSMFull.AutomationExecution.StepExecutions[0].Outputs.InstanceIds[0]"
+            },
+            "ResultPath": "$.AppsCommandResult",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "SetDefaultUpdateInfo",
+                "ResultPath": "$.summaryError"
+              }
+            ],
+            "Next": "ParseUpdateSummary"
+          },
+          "ParseUpdateSummary": {
+            "Comment": "Lambda extracts clean summaries + WSI description from actual command outputs",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "arn:aws:lambda:eu-central-1:274196731166:function:Parse_SSM_Output",
+              "Payload": {
+                "security_output.$": "$.SecurityCommandResult.StandardOutputContent",
+                "apps_output.$": "$.AppsCommandResult.StandardOutputContent",
+                "client.$": "$.PK.S"
+              }
+            },
+            "ResultSelector": {
+              "SecurityUpdates.$": "$.Payload.SecurityUpdates",
+              "AppUpdates.$": "$.Payload.AppUpdates",
+              "WSIDescription.$": "$.Payload.WSIDescription"
+            },
+            "ResultPath": "$.UpdateInfo",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 2,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "SetDefaultUpdateInfo",
+                "ResultPath": "$.summaryError"
+              }
+            ],
+            "Next": "ExtractNewAmiId"
+          },
+          "SetDefaultUpdateInfo": {
+            "Type": "Pass",
+            "Parameters": {
+              "SecurityUpdates": "N/A - erreur extraction logs SSM",
+              "AppUpdates": "N/A - erreur extraction logs SSM",
+              "WSIDescription.$": "States.Format($.PK.S, $.VersionInfo.BuildDate)"
+            },
+            "ResultPath": "$.UpdateInfo",
+            "Next": "ExtractNewAmiId"
+          },
+          "ExtractNewAmiId": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ec2:describeImages",
+            "Parameters": {
+              "Filters": [
+                {
+                  "Name": "name",
+                  "Values.$": "States.Array(States.Format('{}-v{}-{}', $.PK.S, $.VersionInfo.Version, $.VersionInfo.BuildDate))"
+                },
+                {
+                  "Name": "owner-id",
+                  "Values": [
+                    "274196731166"
+                  ]
+                }
+              ]
+            },
+            "ResultPath": "$.AMISearch",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 15,
+                "MaxAttempts": 5,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "RollbackVersion",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "CheckAMIFound"
+          },
+          "CheckAMIFound": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.AMISearch.Images[0].ImageId",
+                "IsPresent": true,
+                "Next": "SetAmiId"
+              }
+            ],
+            "Default": "RollbackVersion"
+          },
+          "SetAmiId": {
+            "Type": "Pass",
+            "Parameters": {
+              "NewAmiId.$": "$.AMISearch.Images[0].ImageId"
+            },
+            "ResultPath": "$.BuildOutput",
+            "Next": "WaitForAMI"
+          },
+          "WaitForAMI": {
+            "Type": "Wait",
+            "Seconds": 120,
+            "Next": "CheckAMIStatus"
+          },
+          "CheckAMIStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ec2:describeImages",
+            "Parameters": {
+              "ImageIds.$": "States.Array($.BuildOutput.NewAmiId)"
+            },
+            "ResultPath": "$.AMIStatus",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 15,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "CleanupNewAMIOnFailure",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "IsAMIAvailable"
+          },
+          "IsAMIAvailable": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.AMIStatus.Images[0].State",
+                "StringEquals": "available",
+                "Next": "ImportWorkspaceImage"
+              },
+              {
+                "Variable": "$.AMIStatus.Images[0].State",
+                "StringEquals": "failed",
+                "Next": "CleanupNewAMIOnFailure"
+              }
+            ],
+            "Default": "WaitForAMI"
+          },
+          "ImportWorkspaceImage": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:workspaces:importWorkspaceImage",
+            "Parameters": {
+              "Ec2ImageId.$": "$.BuildOutput.NewAmiId",
+              "ImageName.$": "States.Format('{}-v{}-{}', $.PK.S, $.VersionInfo.Version, $.VersionInfo.BuildDate)",
+              "ImageDescription.$": "$.UpdateInfo.WSIDescription",
+              "IngestionProcess": "BYOL_REGULAR_WSP"
+            },
+            "ResultPath": "$.ImportResult",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "WorkSpaces.ValidationException"
+                ],
+                "IntervalSeconds": 60,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              },
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "WorkSpaces.ResourceAlreadyExistsException"
+                ],
+                "Next": "IncrementVersionAndRetry",
+                "ResultPath": "$.importError"
+              },
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "CleanupNewAMIOnFailure",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "InitWSIWaitCounter"
+          },
+          "InitWSIWaitCounter": {
+            "Comment": "Initialize WSI polling counter as plain integer 0",
+            "Type": "Pass",
+            "Result": 0,
+            "ResultPath": "$.WSIWaitCount",
+            "Next": "WaitForWSI"
+          },
+          "IncrementVersionAndRetry": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "GImages_State_TABLE",
+              "Key": {
+                "PK": {
+                  "S.$": "$.PK.S"
+                }
+              },
+              "UpdateExpression": "SET MinorVersion = MinorVersion + :inc",
+              "ExpressionAttributeValues": {
+                ":inc": {
+                  "N": "1"
+                }
+              },
+              "ReturnValues": "ALL_NEW"
+            },
+            "ResultPath": "$.VersionRetry",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "CleanupNewAMIOnFailure",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "BuildRetryVersionString"
+          },
+          "BuildRetryVersionString": {
+            "Type": "Pass",
+            "Parameters": {
+              "Version.$": "States.Format('{}.{}', $.VersionRetry.Attributes.MajorVersion.N, $.VersionRetry.Attributes.MinorVersion.N)",
+              "BuildDate.$": "$.VersionInfo.BuildDate"
+            },
+            "ResultPath": "$.VersionInfo",
+            "Next": "ImportWorkspaceImage"
+          },
+          "WaitForWSI": {
+            "Type": "Wait",
+            "Seconds": 240,
+            "Next": "CheckWSIStatus"
+          },
+          "CheckWSIStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:workspaces:describeWorkspaceImages",
+            "Parameters": {
+              "ImageIds.$": "States.Array($.ImportResult.ImageId)"
+            },
+            "ResultPath": "$.WSIResult",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "CleanupNewWSIAndAMI",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "IsWSIReady"
+          },
+          "IsWSIReady": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.WSIResult.Images[0].State",
+                "StringEquals": "AVAILABLE",
+                "Next": "CreateBundle"
+              },
+              {
+                "Variable": "$.WSIResult.Images[0].State",
+                "StringEquals": "ERROR",
+                "Next": "CaptureWSIError"
+              }
+            ],
+            "Default": "IncrementWSIWaitCounter"
+          },
+          "IncrementWSIWaitCounter": {
+            "Type": "Pass",
+            "Parameters": {
+              "NewCount.$": "States.MathAdd($.WSIWaitCount, 1)"
+            },
+            "ResultPath": "$.Temp",
+            "Next": "ApplyWSIWaitCount"
+          },
+          "ApplyWSIWaitCount": {
+            "Type": "Pass",
+            "InputPath": "$.Temp.NewCount",
+            "ResultPath": "$.WSIWaitCount",
+            "Next": "CheckWSITimeout"
+          },
+          "CheckWSITimeout": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.WSIWaitCount",
+                "NumericGreaterThan": 47,
+                "Next": "WSITimedOut"
+              }
+            ],
+            "Default": "WaitForWSI"
+          },
+          "WSITimedOut": {
+            "Type": "Pass",
+            "Parameters": {
+              "WSIErrorMessage": "WSI bloquee en PENDING apres 3 heures - timeout force",
+              "WSIErrorCode": "TIMEOUT",
+              "WSIImageId.$": "$.ImportResult.ImageId"
+            },
+            "ResultPath": "$.WSIError",
+            "Next": "SaveWSIErrorToDB"
+          },
+          "CaptureWSIError": {
+            "Type": "Pass",
+            "Parameters": {
+              "WSIErrorMessage.$": "$.WSIResult.Images[0].ErrorMessage",
+              "WSIErrorCode.$": "$.WSIResult.Images[0].ErrorCode",
+              "WSIImageId.$": "$.ImportResult.ImageId"
+            },
+            "ResultPath": "$.WSIError",
+            "Next": "SaveWSIErrorToDB"
+          },
+          "SaveWSIErrorToDB": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "GImages_State_TABLE",
+              "Key": {
+                "PK": {
+                  "S.$": "$.PK.S"
+                }
+              },
+              "UpdateExpression": "SET LastWSIError = :msg, LastWSIErrorCode = :code",
+              "ExpressionAttributeValues": {
+                ":msg": {
+                  "S.$": "$.WSIError.WSIErrorMessage"
+                },
+                ":code": {
+                  "S.$": "$.WSIError.WSIErrorCode"
+                }
+              }
+            },
+            "ResultPath": null,
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "CleanupNewWSIAndAMI",
+                "ResultPath": "$.dbError"
+              }
+            ],
+            "Next": "CleanupNewWSIAndAMI"
+          },
+          "CleanupNewWSIAndAMI": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:workspaces:deleteWorkspaceImage",
+            "Parameters": {
+              "ImageId.$": "$.ImportResult.ImageId"
+            },
+            "ResultPath": null,
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "CleanupNewAMIOnFailure",
+                "ResultPath": "$.cleanupError"
+              }
+            ],
+            "Next": "CleanupNewAMIOnFailure"
+          },
+          "CleanupNewAMIOnFailure": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ec2:deregisterImage",
+            "Parameters": {
+              "ImageId.$": "$.BuildOutput.NewAmiId"
+            },
+            "ResultPath": null,
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "DeleteOrphanSnapshots",
+                "ResultPath": "$.cleanupError"
+              }
+            ],
+            "Next": "DeleteOrphanSnapshots"
+          },
+          "DeleteOrphanSnapshots": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ec2:describeSnapshots",
+            "Parameters": {
+              "Filters": [
+                {
+                  "Name": "description",
+                  "Values.$": "States.Array(States.Format('*{}*', $.BuildOutput.NewAmiId))"
+                }
+              ],
+              "OwnerIds": [
+                "274196731166"
+              ]
+            },
+            "ResultPath": "$.OrphanSnapshots",
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "RollbackVersion",
+                "ResultPath": "$.cleanupError"
+              }
+            ],
+            "Next": "CheckOrphanSnapshot"
+          },
+          "CheckOrphanSnapshot": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.OrphanSnapshots.Snapshots[0].SnapshotId",
+                "IsPresent": true,
+                "Next": "DeleteOrphanSnapshot"
+              }
+            ],
+            "Default": "RollbackVersion"
+          },
+          "DeleteOrphanSnapshot": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ec2:deleteSnapshot",
+            "Parameters": {
+              "SnapshotId.$": "$.OrphanSnapshots.Snapshots[0].SnapshotId"
+            },
+            "ResultPath": null,
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "RollbackVersion",
+                "ResultPath": "$.cleanupError"
+              }
+            ],
+            "Next": "RollbackVersion"
+          },
+          "RollbackVersion": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "GImages_State_TABLE",
+              "Key": {
+                "PK": {
+                  "S.$": "$.PK.S"
+                }
+              },
+              "UpdateExpression": "SET MinorVersion = MinorVersion - :dec, MajorVersion = MajorVersion - :dec",
+              "ConditionExpression": "MinorVersion = :zero",
+              "ExpressionAttributeValues": {
+                ":dec": {
+                  "N": "1"
+                },
+                ":zero": {
+                  "N": "0"
+                }
+              }
+            },
+            "ResultPath": null,
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "DynamoDB.ConditionalCheckFailedException",
+                  "DynamoDb.ConditionalCheckFailedException"
+                ],
+                "Next": "RollbackMinorOnly",
+                "ResultPath": "$.rollbackError"
+              },
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "MarkTenantFailed",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "MarkTenantFailed"
+          },
+          "RollbackMinorOnly": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "GImages_State_TABLE",
+              "Key": {
+                "PK": {
+                  "S.$": "$.PK.S"
+                }
+              },
+              "UpdateExpression": "SET MinorVersion = MinorVersion - :dec",
+              "ExpressionAttributeValues": {
+                ":dec": {
+                  "N": "1"
+                }
+              }
+            },
+            "ResultPath": null,
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "MarkTenantFailed",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "MarkTenantFailed"
+          },
+          "CreateBundle": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:workspaces:createWorkspaceBundle",
+            "Parameters": {
+              "BundleName.$": "States.Format('{}-v{}-{}', $.PK.S, $.VersionInfo.Version, $.VersionInfo.BuildDate)",
+              "BundleDescription.$": "$.UpdateInfo.WSIDescription",
+              "ImageId.$": "$.ImportResult.ImageId",
+              "ComputeType": {
+                "Name": "STANDARD"
+              },
+              "UserStorage": {
+                "Capacity": "10"
+              },
+              "RootStorage": {
+                "Capacity": "80"
+              }
+            },
+            "ResultPath": "$.BundleResult",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "CleanupNewWSIAndAMI",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "CheckIfPreviousExists"
+          },
+          "CheckIfPreviousExists": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "And": [
+                  {
+                    "Variable": "$.PreviousBundleId",
+                    "IsPresent": true
+                  },
+                  {
+                    "Variable": "$.PreviousBundleId.S",
+                    "IsPresent": true
+                  },
+                  {
+                    "Variable": "$.PreviousBundleId.S",
+                    "StringGreaterThan": "N/A"
+                  },
+                  {
+                    "Variable": "$.PreviousAmiId",
+                    "IsPresent": true
+                  },
+                  {
+                    "Variable": "$.PreviousAmiId.S",
+                    "IsPresent": true
+                  },
+                  {
+                    "Variable": "$.PreviousAmiId.S",
+                    "StringGreaterThan": "N/A"
+                  }
+                ],
+                "Next": "DeleteOldBundle"
+              }
+            ],
+            "Default": "UpdateDB"
+          },
+          "DeleteOldBundle": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:workspaces:deleteWorkspaceBundle",
+            "Parameters": {
+              "BundleId.$": "$.PreviousBundleId.S"
+            },
+            "ResultPath": null,
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "DeleteOldWSI",
+                "ResultPath": "$.cleanupError"
+              }
+            ],
+            "Next": "DeleteOldWSI"
+          },
+          "DeleteOldWSI": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:workspaces:deleteWorkspaceImage",
+            "Parameters": {
+              "ImageId.$": "$.PreviousWSIId.S"
+            },
+            "ResultPath": null,
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "DeregisterOldAMI",
+                "ResultPath": "$.cleanupError"
+              }
+            ],
+            "Next": "DeregisterOldAMI"
+          },
+          "DeregisterOldAMI": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ec2:deregisterImage",
+            "Parameters": {
+              "ImageId.$": "$.PreviousAmiId.S"
+            },
+            "ResultPath": null,
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "DeleteOldSnapshot",
+                "ResultPath": "$.cleanupError"
+              }
+            ],
+            "Next": "DeleteOldSnapshot"
+          },
+          "DeleteOldSnapshot": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ec2:describeSnapshots",
+            "Parameters": {
+              "Filters": [
+                {
+                  "Name": "description",
+                  "Values.$": "States.Array(States.Format('*{}*', $.PreviousAmiId.S))"
+                }
+              ],
+              "OwnerIds": [
+                "274196731166"
+              ]
+            },
+            "ResultPath": "$.OldSnapshots",
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "UpdateDB",
+                "ResultPath": "$.cleanupError"
+              }
+            ],
+            "Next": "CheckSnapshotExists"
+          },
+          "CheckSnapshotExists": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.OldSnapshots.Snapshots[0].SnapshotId",
+                "IsPresent": true,
+                "Next": "DeleteSnapshot"
+              }
+            ],
+            "Default": "UpdateDB"
+          },
+          "DeleteSnapshot": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ec2:deleteSnapshot",
+            "Parameters": {
+              "SnapshotId.$": "$.OldSnapshots.Snapshots[0].SnapshotId"
+            },
+            "ResultPath": null,
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "UpdateDB",
+                "ResultPath": "$.cleanupError"
+              }
+            ],
+            "Next": "UpdateDB"
+          },
+          "UpdateDB": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "GImages_State_TABLE",
+              "Key": {
+                "PK": {
+                  "S.$": "$.PK.S"
+                }
+              },
+              "UpdateExpression": "SET DeployStatus = :s, CandidateBundleId = :b, LastBuildTime = :t, CurrentImageVersion = :v, SourceAmiId = :newami, CurrentWSIId = :wsi, PreviousBundleId = if_not_exists(CandidateBundleId, :na), PreviousAmiId = if_not_exists(SourceAmiId, :oldami), PreviousWSIId = if_not_exists(CurrentWSIId, :na), PreviousVersion = if_not_exists(CurrentImageVersion, :na) REMOVE LastWSIError, LastWSIErrorCode",
+              "ExpressionAttributeValues": {
+                ":s": {
+                  "S": "READY_FOR_DEPLOYMENT"
+                },
+                ":b": {
+                  "S.$": "$.BundleResult.WorkspaceBundle.BundleId"
+                },
+                ":t": {
+                  "S.$": "$$.Execution.StartTime"
+                },
+                ":v": {
+                  "S.$": "$.VersionInfo.Version"
+                },
+                ":newami": {
+                  "S.$": "$.BuildOutput.NewAmiId"
+                },
+                ":wsi": {
+                  "S.$": "$.ImportResult.ImageId"
+                },
+                ":oldami": {
+                  "S.$": "$.SourceAmiId.S"
+                },
+                ":na": {
+                  "S": "N/A"
+                }
+              }
+            },
+            "ResultPath": "$.DBResult",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "MarkTenantFailed",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "RecordSuccess"
+          },
+          "RecordSuccess": {
+            "Type": "Pass",
+            "Parameters": {
+              "Client.$": "$.PK.S",
+              "Status": "SUCCESS",
+              "Version.$": "$.VersionInfo.Version",
+              "BuildDate.$": "$.VersionInfo.BuildDate",
+              "AmiId.$": "$.BuildOutput.NewAmiId",
+              "WsiId.$": "$.ImportResult.ImageId",
+              "BundleId.$": "$.BundleResult.WorkspaceBundle.BundleId",
+              "BundleName.$": "States.Format('{}-v{}-{}', $.PK.S, $.VersionInfo.Version, $.VersionInfo.BuildDate)",
+              "SecurityUpdates.$": "$.UpdateInfo.SecurityUpdates",
+              "AppUpdates.$": "$.UpdateInfo.AppUpdates",
+              "WSIDescription.$": "$.UpdateInfo.WSIDescription",
+              "Error": "Aucune"
+            },
+            "End": true
+          },
+          "MarkTenantFailed": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "GImages_State_TABLE",
+              "Key": {
+                "PK": {
+                  "S.$": "$.PK.S"
+                }
+              },
+              "UpdateExpression": "SET DeployStatus = :s, LastErrorTime = :t",
+              "ExpressionAttributeValues": {
+                ":s": {
+                  "S": "BUILD_FAILED"
+                },
+                ":t": {
+                  "S.$": "$$.Execution.StartTime"
+                }
+              }
+            },
+            "ResultPath": null,
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "RecordFailure",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "RecordFailure"
+          },
+          "RecordFailure": {
+            "Type": "Pass",
+            "Parameters": {
+              "Client.$": "$.PK.S",
+              "Status": "FAILED",
+              "Version": "N/A",
+              "BuildDate": "N/A",
+              "AmiId": "N/A",
+              "WsiId": "N/A",
+              "BundleId": "N/A",
+              "BundleName": "N/A",
+              "SecurityUpdates": "N/A",
+              "AppUpdates": "N/A",
+              "WSIDescription": "N/A",
+              "Error": "Build echoue - verifier DynamoDB (LastWSIError) et Step Functions logs"
+            },
+            "End": true
+          }
+        }
+      },
+      "Next": "BuildEmailReport"
+    },
+    "BuildEmailReport": {
+      "Type": "Pass",
+      "Parameters": {
+        "BuildResults.$": "$.BuildResults",
+        "NbClients.$": "States.ArrayLength($.BuildResults)",
+        "ExecDate.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)",
+        "ExecName.$": "$$.Execution.Name",
+        "ExecId.$": "$$.Execution.Id"
+      },
+      "Next": "FormatEmailReport"
+    },
+    "FormatEmailReport": {
+      "Comment": "Lambda formats all client results into clean readable email for any number of clients",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:eu-central-1:274196731166:function:Format_Email_Report",
+        "Payload": {
+          "results.$": "$.BuildResults",
+          "exec_date.$": "$.ExecDate",
+          "exec_name.$": "$.ExecName",
+          "exec_id.$": "$.ExecId",
+          "nb_clients.$": "$.NbClients"
+        }
+      },
+      "ResultSelector": {
+        "Subject.$": "$.Payload.Subject",
+        "Message.$": "$.Payload.Message"
+      },
+      "ResultPath": "$.EmailContent",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SendGlobalReportFallback",
+          "ResultPath": "$.formatError"
+        }
+      ],
+      "Next": "SendGlobalReport"
+    },
+    "SendGlobalReport": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:eu-central-1:274196731166:UpdatesValidationEmail",
+        "Subject.$": "$.EmailContent.Subject",
+        "Message.$": "$.EmailContent.Message"
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ExecutionSucceeded",
+          "ResultPath": "$.notifError"
+        }
+      ],
+      "Next": "ExecutionSucceeded"
+    },
+    "SendGlobalReportFallback": {
+      "Comment": "Lambda failed - send raw JSON fallback so results are never lost",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:eu-central-1:274196731166:UpdatesValidationEmail",
+        "Subject.$": "States.Format('[VDI Factory] Rapport du {} - {} client(s)', $.ExecDate, $.NbClients)",
+        "Message.$": "States.Format('========================================\nRAPPORT VDI IMAGE FACTORY\n========================================\nDate:      {}\nExecution: {}\nClients:   {}\n========================================\n\n{}\n\n========================================\nACTIONS:\n  SUCCESS -> Bundle READY_FOR_DEPLOYMENT\n  FAILED  -> Verifier DynamoDB (LastWSIError)\nhttps://eu-central-1.console.aws.amazon.com/states/home#/executions/details/{}\n========================================', $.ExecDate, $.ExecName, $.NbClients, States.JsonToString($.BuildResults), $.ExecId)"
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ExecutionSucceeded",
+          "ResultPath": "$.notifError"
+        }
+      ],
+      "Next": "ExecutionSucceeded"
+    },
+    "ExecutionSucceeded": {
+      "Type": "Succeed"
+    }
+  }
+}
